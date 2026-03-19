@@ -72,6 +72,7 @@ Detects brightness discontinuities at chunk boundaries (common in multi-chunk AI
 - **Start with defaults** — they work well for most AI-generated video
 - **Increase `window_size`** (e.g. 25–31) if flicker is still visible
 - **Increase `strength`** above 1.0 if correction is not strong enough
+- **Set `drift_mode` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
 - **Turn on `pixel_smoothing`** (0.3–0.5) if different parts of the frame flicker differently
 - **Increase `grid_size`** (e.g. 4–6) only if the flicker is not uniform across the frame (e.g. one side flickers more than the other). The default global correction works well for most cases.
 - **Lower `eq_sensitivity`** (e.g. 1.0) to catch subtle chunk boundaries
