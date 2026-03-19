@@ -41,7 +41,7 @@ The node outputs two images:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `window_size` | 15 | Temporal smoothing window in frames. Larger = more aggressive flicker removal. Use 11–15 for mild flicker, 21–31 for heavy flicker. Must be odd. |
-| `strength` | 1.2 | Correction strength. 0 = off, 1 = full correction, >1 = overcorrect (useful for stubborn flicker). |
+| `strength` | 1.2 | Correction strength. 0 = off, 1 = full correction, >1 = overcorrect (useful for stubborn flicker). **Caution:** values much above 1.5 may introduce artifacts. |
 | `channels` | LAB | `LAB`: corrects each RGB channel independently — removes both brightness and color temperature flicker. `L`: brightness only — preserves original color relationships. |
 | `use_median` | off | Median pre-filter before Gaussian smoothing. Turn on if you have extreme outlier frames (single very bright/dark frames). |
 | `pixel_smoothing` | 0.0 | Per-pixel temporal smoothing. `0.0` = off. `0.3–0.5` = recommended for AI video with spatially varying flicker. **Warning:** can cause ghosting on fast-moving objects. Start low and increase carefully. |
