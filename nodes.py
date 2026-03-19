@@ -22,6 +22,10 @@ class DeflickerFrames:
                     "default": "LAB",
                     "tooltip": "LAB: brightness + color. L: brightness only.",
                 }),
+                "drift_mode": (["auto", "flicker_only", "preserve_trend"], {
+                    "default": "auto",
+                    "tooltip": "Auto: detect trend automatically. Flicker only: remove all brightness changes including slow drift. Preserve trend: always keep slow brightness changes.",
+                }),
                 "use_median": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Median pre-filter for extreme outlier frames.",
@@ -54,13 +58,14 @@ class DeflickerFrames:
     FUNCTION = "deflicker"
     CATEGORY = "deflicker"
 
-    def deflicker(self, images, window_size, strength, channels, use_median,
+    def deflicker(self, images, window_size, strength, channels, drift_mode, use_median,
                   pixel_smoothing, grid_size, equalize, eq_blend_radius, eq_sensitivity):
         # Phase 1: Temporal deflicker
         corrected, heatmap = deflicker_frames(
             images=images, window_size=window_size, strength=strength,
             channels=channels, use_median=use_median,
             pixel_smoothing=pixel_smoothing, grid_size=grid_size,
+            drift_mode=drift_mode,
         )
 
         # Phase 2: Auto brightness equalize (boundary smoothing)

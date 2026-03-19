@@ -335,6 +335,7 @@ def deflicker_frames(
     use_median: bool = False,
     pixel_smoothing: float = 0.0,
     grid_size: int = 1,
+    drift_mode: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remove temporal brightness/color flicker from a frame sequence.
 
@@ -353,10 +354,10 @@ def deflicker_frames(
                   "LAB" = per-channel correction (fixes color flicker too).
         use_median: Use median pre-filter (robust to extreme outlier frames).
         pixel_smoothing: Per-pixel temporal smoothing strength (0=off, 1=full).
-            Blends each pixel with its temporally smoothed version. Helps with
-            spatially varying flicker but can soften fast motion. 0.3-0.5
-            recommended for AI video.
         grid_size: Spatial grid for correction. 1 = global, >1 = per-cell.
+        drift_mode: "auto" = detect trend automatically,
+                    "flicker_only" = remove all changes including slow drift,
+                    "preserve_trend" = always keep slow brightness changes.
 
     Returns:
         (corrected_images, debug_heatmap) — both [B, H, W, 3].
@@ -369,9 +370,15 @@ def deflicker_frames(
 
     smooth_fn = temporal_median_smooth if use_median else temporal_smooth
 
-    # Global trend detection based on overall brightness (mean of RGB).
-    brightness_means = images.mean(dim=(2, 3)).mean(dim=1)
-    has_trend = _detect_trend(brightness_means)
+    # Determine trend handling based on drift_mode
+    if drift_mode == "flicker_only":
+        has_trend = False
+    elif drift_mode == "preserve_trend":
+        has_trend = True
+    else:
+        # Auto: detect trend from brightness
+        brightness_means = images.mean(dim=(2, 3)).mean(dim=1)
+        has_trend = _detect_trend(brightness_means)
 
     # --- Phase 1: Per-frame statistics correction ---
     correct_fn = _correct_channel if grid_size <= 1 else (
