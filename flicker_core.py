@@ -113,14 +113,14 @@ def _correct_channel(
     smooth_fn,
     has_trend: bool = False,
 ) -> torch.Tensor:
-    """Correct a single channel's temporal flicker.
+    """Correct a single channel's temporal flicker using gain-based correction.
 
-    Algorithm (inspired by LRTimelapse multi-pass deflicker):
-    - No trend: flatten means/stds to their global constants → near-100% removal.
-    - Trend detected: use iterative wide-window smoothing → preserves trend.
+    Uses multiplicative (gain) correction instead of affine (mean+std) to
+    preserve black levels: pixel * gain keeps 0 at 0, like an exposure dial.
 
-    The has_trend flag is passed from the caller (detected on brightness,
-    not per-channel) to ensure consistent treatment of all channels.
+    Algorithm:
+    - No trend: flatten means to global constant via gain.
+    - Trend detected: fit polynomial or wide-window smooth, apply via gain.
 
     Args:
         ch_data: [N, H, W] single channel.
@@ -136,10 +136,7 @@ def _correct_channel(
     flat = ch_data.reshape(num_frames, -1)
 
     frame_means = flat.mean(dim=1)  # [N]
-    frame_stds = flat.std(dim=1)    # [N]
-
     global_mean = frame_means.mean()
-    global_std = frame_stds.mean()
 
     if has_trend:
         # Trend detected: fit a low-order polynomial to capture the smooth
@@ -173,25 +170,19 @@ def _correct_channel(
             target_means = corrected_means
         else:
             target_means = poly_target
-
-        # In trend mode, flatten std to global constant to avoid artifacts.
-        target_stds = torch.full_like(frame_stds, global_std)
     else:
-        # No significant trend: flatten to constants → near-100% removal.
+        # No significant trend: flatten to constant → near-100% removal.
         target_means = torch.full_like(frame_means, global_mean)
-        target_stds = torch.full_like(frame_stds, global_std)
 
     # Blend with strength
     final_means = frame_means + (target_means - frame_means) * strength
-    final_stds = frame_stds + (target_stds - frame_stds) * strength
-    safe_stds = frame_stds.clamp(min=1e-6)
 
-    # --- Apply affine correction per frame ---
-    means_3d = frame_means.view(-1, 1, 1)
-    scales_3d = (final_stds / safe_stds).view(-1, 1, 1)
-    target_3d = final_means.view(-1, 1, 1)
+    # --- Apply gain-based correction per frame ---
+    # gain = target / current — keeps 0 at 0 (like exposure compensation)
+    safe_means = frame_means.clamp(min=1e-6)
+    gains = (final_means / safe_means).view(-1, 1, 1)
 
-    corrected = (ch_data - means_3d) * scales_3d + target_3d
+    corrected = ch_data * gains
 
     return corrected
 
@@ -204,10 +195,10 @@ def _correct_channel_grid(
     has_trend: bool,
     grid_size: int,
 ) -> torch.Tensor:
-    """Correct a single channel using per-cell statistics on a spatial grid.
+    """Correct a single channel using per-cell gain on a spatial grid.
 
-    Computes per-cell mean/std for all cells at once using avg_pool2d,
-    then applies affine correction per cell with blurred seams.
+    Computes per-cell means using avg_pool2d, then applies multiplicative
+    gain correction per cell with bilinear-interpolated seams.
 
     Args:
         ch_data: [N, H, W] single channel.
@@ -220,51 +211,35 @@ def _correct_channel_grid(
     N, H, W = ch_data.shape
     device = ch_data.device
 
-    # Compute per-cell means and stds using adaptive avg pool
+    # Compute per-cell means using adaptive avg pool
     # [N, H, W] -> [N, 1, H, W] -> pool to [N, 1, grid, grid]
     data_4d = ch_data.unsqueeze(1)
     cell_means = F.adaptive_avg_pool2d(data_4d, grid_size).squeeze(1)  # [N, G, G]
 
-    # Per-cell std: E[x^2] - E[x]^2
-    data_sq = (ch_data ** 2).unsqueeze(1)
-    cell_sq_means = F.adaptive_avg_pool2d(data_sq, grid_size).squeeze(1)  # [N, G, G]
-    cell_stds = (cell_sq_means - cell_means ** 2).clamp(min=1e-12).sqrt()  # [N, G, G]
-
-    # For each cell: compute global mean/std across frames, then target
-    correction_means = torch.zeros(N, grid_size, grid_size, device=device)
-    correction_scales = torch.ones(N, grid_size, grid_size, device=device)
+    # For each cell: compute gain = target_mean / current_mean
+    gains = torch.ones(N, grid_size, grid_size, device=device)
 
     for gy in range(grid_size):
         for gx in range(grid_size):
             cm = cell_means[:, gy, gx]  # [N]
-            cs = cell_stds[:, gy, gx]   # [N]
-
             global_mean = cm.mean()
-            global_std = cs.mean()
 
             if has_trend:
                 target_means = smooth_fn(cm, window_size)
             else:
                 target_means = torch.full_like(cm, global_mean)
-            target_stds = torch.full_like(cs, global_std)
 
             final_means = cm + (target_means - cm) * strength
-            final_stds = cs + (target_stds - cs) * strength
-            safe_stds = cs.clamp(min=1e-6)
+            safe_means = cm.clamp(min=1e-6)
 
-            correction_means[:, gy, gx] = final_means - cm * (final_stds / safe_stds)
-            correction_scales[:, gy, gx] = final_stds / safe_stds
+            gains[:, gy, gx] = final_means / safe_means
 
-    # Upsample correction maps from [N, G, G] to [N, H, W] with bilinear interpolation
-    # This naturally creates smooth transitions between cells
-    scales_up = F.interpolate(
-        correction_scales.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False,
-    ).squeeze(1)  # [N, H, W]
-    offsets_up = F.interpolate(
-        correction_means.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False,
+    # Upsample gain map from [N, G, G] to [N, H, W] with bilinear interpolation
+    gains_up = F.interpolate(
+        gains.unsqueeze(1), size=(H, W), mode="bilinear", align_corners=False,
     ).squeeze(1)  # [N, H, W]
 
-    return ch_data * scales_up + offsets_up
+    return ch_data * gains_up
 
 
 # ---------------------------------------------------------------------------
