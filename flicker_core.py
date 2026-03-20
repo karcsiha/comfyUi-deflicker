@@ -306,7 +306,7 @@ def deflicker_frames(
     images: torch.Tensor,
     window_size: int = 15,
     strength: float = 1.0,
-    channels: str = "LAB",
+    channels: str = "L",
     use_median: bool = False,
     pixel_smoothing: float = 0.0,
     grid_size: int = 1,

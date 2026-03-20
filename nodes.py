@@ -18,8 +18,8 @@ class DeflickerFrames:
                     "default": 1.2, "min": 0.0, "max": 2.0, "step": 0.05,
                     "tooltip": "Correction strength. 0 = off, 1 = full, >1 = overcorrect.",
                 }),
-                "channels": (["LAB", "L"], {
-                    "default": "LAB",
+                "channels": (["L", "LAB"], {
+                    "default": "L",
                     "tooltip": "LAB: brightness + color. L: brightness only.",
                 }),
                 "drift_mode": (["auto", "flicker_only", "preserve_trend"], {
