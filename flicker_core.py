@@ -179,8 +179,8 @@ def _correct_channel(
 
     # --- Apply gain-based correction per frame ---
     # gain = target / current — keeps 0 at 0 (like exposure compensation)
-    safe_means = frame_means.clamp(min=1e-6)
-    gains = (final_means / safe_means).view(-1, 1, 1)
+    safe_means = frame_means.clamp(min=1e-2)
+    gains = (final_means / safe_means).clamp(0.25, 4.0).view(-1, 1, 1)
 
     corrected = ch_data * gains
 
@@ -230,9 +230,9 @@ def _correct_channel_grid(
                 target_means = torch.full_like(cm, global_mean)
 
             final_means = cm + (target_means - cm) * strength
-            safe_means = cm.clamp(min=1e-6)
+            safe_means = cm.clamp(min=1e-2)
 
-            gains[:, gy, gx] = final_means / safe_means
+            gains[:, gy, gx] = (final_means / safe_means).clamp(0.25, 4.0)
 
     # Upsample gain map from [N, G, G] to [N, H, W] with bilinear interpolation
     gains_up = F.interpolate(
@@ -365,8 +365,10 @@ def deflicker_frames(
         corrected_brightness = correct_fn(
             brightness, window_size, strength, smooth_fn, has_trend,
         )
-        delta = (corrected_brightness - brightness).unsqueeze(-1)
-        corrected = (images + delta).clamp(0.0, 1.0)
+        # Apply as multiplicative gain map to preserve black levels
+        gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
+        gain_map = gain_map.clamp(0.25, 4.0)
+        corrected = (images * gain_map).clamp(0.0, 1.0)
     else:
         corrected = images.clone()
         for ch in range(3):
