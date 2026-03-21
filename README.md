@@ -40,13 +40,13 @@ The node outputs two images:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| **mode** | step_removal | **step_removal**: instant correction of sharp brightness steps caused by latent space shifts — preserves natural trends, only removes discontinuities. **temporal_smoothing**: Gaussian window-based correction for random per-frame flicker. **both**: step removal first, then temporal smoothing. |
+| **mode** | both | **both**: step removal first, then temporal smoothing (recommended). **step_removal**: instant correction of sharp latent space shifts only. **temporal_smoothing**: Gaussian window-based correction for random flicker only. |
 | **channels** | L | `L`: brightness only — preserves original colors. `LAB`: brightness + color correction. |
 | | | **Step Removal** |
-| `step_strength` | 1.0 | Step removal correction strength. 0 = off, 1 = full. Ignored in temporal_smoothing mode. |
+| `step_strength` | 1.2 | Step removal correction strength. 0 = off, 1 = full. Ignored in temporal_smoothing mode. |
 | | | **Temporal Smoothing** |
 | `smooth_strength` | 1.0 | Temporal smoothing strength. 0 = off, 1 = full, >1 = overcorrect. Ignored in step_removal mode. **Caution:** values above 1.5 may introduce artifacts. |
-| `smooth_window` | 15 | Temporal smoothing window in frames. Larger = more aggressive. Use 11–15 for mild flicker, 21–31 for heavy. Must be odd. Ignored in step_removal mode. |
+| `smooth_window` | 25 | Temporal smoothing window in frames. Larger = more aggressive. Use 11–15 for mild flicker, 21–31 for heavy. Must be odd. Ignored in step_removal mode. |
 | `smooth_drift` | auto | `auto`: detect trends automatically. `flicker_only`: remove all brightness changes. `preserve_trend`: keep slow changes. Ignored in step_removal mode. |
 | `smooth_median` | off | Median pre-filter for extreme outlier frames. Ignored in step_removal mode. |
 | `smooth_pixel` | 0.0 | Per-pixel temporal smoothing. 0=off, 0.3–0.5=AI video. **Warning:** can cause ghosting. Ignored in step_removal mode. |

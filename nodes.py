@@ -10,8 +10,8 @@ class DeflickerFrames:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "mode": (["step_removal", "temporal_smoothing", "both"], {
-                    "default": "step_removal",
+                "mode": (["both", "step_removal", "temporal_smoothing"], {
+                    "default": "both",
                     "tooltip": "Step removal: instant correction of sharp latent space shifts. Temporal smoothing: Gaussian window-based correction for random flicker. Both: step removal first, then temporal smoothing.",
                 }),
                 "channels": (["L", "LAB"], {
@@ -19,7 +19,7 @@ class DeflickerFrames:
                     "tooltip": "L: brightness only — preserves original colors. LAB: brightness + color correction.",
                 }),
                 "step_strength": ("FLOAT", {
-                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "default": 1.2, "min": 0.0, "max": 2.0, "step": 0.05,
                     "tooltip": "Step removal strength. 1 = full correction. Ignored in temporal_smoothing mode.",
                 }),
                 "smooth_strength": ("FLOAT", {
@@ -27,7 +27,7 @@ class DeflickerFrames:
                     "tooltip": "Temporal smoothing strength. 1 = full, >1 = overcorrect. Ignored in step_removal mode.",
                 }),
                 "smooth_window": ("INT", {
-                    "default": 15, "min": 3, "max": 999, "step": 2,
+                    "default": 25, "min": 3, "max": 999, "step": 2,
                     "tooltip": "Temporal smoothing window (frames). Larger = more aggressive. Ignored in step_removal mode.",
                 }),
                 "smooth_drift": (["auto", "flicker_only", "preserve_trend"], {
