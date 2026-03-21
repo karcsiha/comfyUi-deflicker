@@ -1,7 +1,7 @@
 import torch
 
 from .brightness_core import auto_brightness_equalize
-from .flicker_core import deflicker_frames
+from .flicker_core import deflicker_frames, _compute_content_mask
 
 
 class DeflickerFrames:
@@ -10,9 +10,13 @@ class DeflickerFrames:
         return {
             "required": {
                 "images": ("IMAGE",),
+                "mode": (["temporal_smoothing", "step_removal", "both"], {
+                    "default": "temporal_smoothing",
+                    "tooltip": "Temporal smoothing: Gaussian window-based correction for random flicker. Step removal: instant correction of sharp latent space shifts. Both: step removal first, then temporal smoothing.",
+                }),
                 "window_size": ("INT", {
-                    "default": 15, "min": 3, "max": 99, "step": 2,
-                    "tooltip": "Temporal smoothing window (frames). Larger = more aggressive.",
+                    "default": 15, "min": 3, "max": 999, "step": 2,
+                    "tooltip": "Temporal smoothing window (frames). Larger = more aggressive. Only used in temporal_smoothing/both modes.",
                 }),
                 "strength": ("FLOAT", {
                     "default": 1.2, "min": 0.0, "max": 2.0, "step": 0.05,
@@ -58,14 +62,19 @@ class DeflickerFrames:
     FUNCTION = "deflicker"
     CATEGORY = "deflicker"
 
-    def deflicker(self, images, window_size, strength, channels, drift_mode, use_median,
-                  pixel_smoothing, grid_size, equalize, eq_blend_radius, eq_sensitivity):
-        # Phase 1: Temporal deflicker
+    def deflicker(self, images, mode, window_size, strength, channels, drift_mode,
+                  use_median, pixel_smoothing, grid_size, equalize, eq_blend_radius,
+                  eq_sensitivity):
+        # Compute content mask once from original images (excludes black borders)
+        content_mask = _compute_content_mask(images)
+
+        # Phase 1: Deflicker (temporal smoothing / step removal / both)
         corrected, heatmap = deflicker_frames(
             images=images, window_size=window_size, strength=strength,
             channels=channels, use_median=use_median,
             pixel_smoothing=pixel_smoothing, grid_size=grid_size,
-            drift_mode=drift_mode,
+            drift_mode=drift_mode, content_mask=content_mask,
+            mode=mode,
         )
 
         # Phase 2: Auto brightness equalize (boundary smoothing)
@@ -73,7 +82,7 @@ class DeflickerFrames:
             corrected, eq_heatmap = auto_brightness_equalize(
                 images=corrected, blend_radius=eq_blend_radius,
                 strength=strength, sensitivity=eq_sensitivity,
-                grid_size=grid_size,
+                grid_size=grid_size, content_mask=content_mask,
             )
 
         return (corrected, heatmap)

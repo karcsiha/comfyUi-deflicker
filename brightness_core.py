@@ -2,6 +2,11 @@ import torch
 import torch.nn.functional as F
 from typing import List
 
+try:
+    from .flicker_core import _compute_content_mask
+except ImportError:
+    from flicker_core import _compute_content_mask
+
 
 # ---------------------------------------------------------------------------
 # sRGB <-> LAB color space conversion (pure torch, GPU-compatible)
@@ -139,7 +144,8 @@ def _compute_auto_threshold(frame_diffs: torch.Tensor, sensitivity: float) -> fl
 
 
 def detect_boundaries_auto(L: torch.Tensor, detection_threshold: float = 0.0,
-                           sensitivity: float = 3.0) -> List[int]:
+                           sensitivity: float = 3.0,
+                           content_mask: torch.Tensor | None = None) -> List[int]:
     """Auto-detect boundaries by finding frames with large luminance jumps.
 
     Args:
@@ -148,6 +154,7 @@ def detect_boundaries_auto(L: torch.Tensor, detection_threshold: float = 0.0,
             automatically from the sequence statistics.
         sensitivity: For auto threshold: multiplier for std deviation above median.
             Lower = more sensitive. Default 3.0 (detects clear outlier jumps).
+        content_mask: [H, W] bool mask. True = content pixel for stats.
 
     Returns list of frame indices where a new chunk starts (the frame AFTER the jump).
     """
@@ -155,8 +162,11 @@ def detect_boundaries_auto(L: torch.Tensor, detection_threshold: float = 0.0,
     if num_frames < 2:
         return []
 
-    # Compute per-frame mean luminance
-    frame_means = L.reshape(num_frames, -1).mean(dim=1)  # [B]
+    # Compute per-frame mean luminance (masked if provided)
+    if content_mask is not None:
+        frame_means = L[:, content_mask].mean(dim=1)  # [B]
+    else:
+        frame_means = L.reshape(num_frames, -1).mean(dim=1)  # [B]
 
     # Compute frame-to-frame absolute differences
     frame_diffs = (frame_means[1:] - frame_means[:-1]).abs()  # [B-1]
@@ -425,6 +435,7 @@ def auto_brightness_equalize(
     sensitivity: float = 3.0,
     ref_frames: int = 0,
     grid_size: int = 1,
+    content_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Main entry point. Returns (corrected_images, debug_heatmap).
 
@@ -443,13 +454,24 @@ def auto_brightness_equalize(
         ref_frames: Number of initial frames to use as brightness reference.
             Set to 0 to skip drift correction.
         grid_size: Spatial grid for correction. 1 = global, >1 = per-cell.
+        content_mask: [H, W] bool mask from _compute_content_mask(). If None,
+            computed automatically.
     """
     num_frames, H, W, C = images.shape
     device = images.device
 
+    # Auto-detect black borders (stabilized/cropped footage)
+    if content_mask is None:
+        content_mask = _compute_content_mask(images)
+
     # Convert all images to LAB
     lab = srgb_to_lab(images)
     L = lab[..., 0]  # [B, H, W]
+
+    # Content mask for LAB space (same spatial mask)
+    # For LAB stats, we also need a mask on the L channel in [0, 100] range.
+    # Reuse the sRGB mask since border positions don't change with color space.
+    lab_mask = content_mask  # [H, W] bool
 
     # Channel ranges: L=[0,100], a=[-128,128], b=[-128,128]
     ch_ranges = [(0.0, 100.0), (-128.0, 128.0), (-128.0, 128.0)]
@@ -465,11 +487,14 @@ def auto_brightness_equalize(
     ref_end = ref_frames if ref_frames > 0 and num_frames > ref_frames else 0
 
     if ref_end > 0:
-        # Compute per-frame means for each LAB channel
+        # Compute per-frame means for each LAB channel (masked)
         all_means = []  # [3, num_frames]
         for ch in range(3):
             ch_data = lab[..., ch]  # [num_frames, H, W]
-            frame_means = ch_data.reshape(num_frames, -1).mean(dim=1)  # [num_frames]
+            if lab_mask is not None:
+                frame_means = ch_data[:, lab_mask].mean(dim=1)
+            else:
+                frame_means = ch_data.reshape(num_frames, -1).mean(dim=1)
             all_means.append(frame_means)
 
         # Compute temporally smoothed target means
@@ -494,7 +519,8 @@ def auto_brightness_equalize(
     # Re-extract L from drift-corrected data for boundary detection
     L_corrected = corrected_lab[..., 0]
 
-    boundaries = detect_boundaries_auto(L_corrected, detection_threshold, sensitivity)
+    boundaries = detect_boundaries_auto(L_corrected, detection_threshold, sensitivity,
+                                            content_mask=lab_mask)
 
     if boundaries:
         # Group nearby boundaries into transition zones

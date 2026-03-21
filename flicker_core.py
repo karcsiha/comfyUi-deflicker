@@ -13,6 +13,40 @@ import torch
 import torch.nn.functional as F
 
 
+# ---------------------------------------------------------------------------
+# Border masking — exclude black bars from statistics
+# ---------------------------------------------------------------------------
+
+def _compute_content_mask(images: torch.Tensor, threshold: float = 0.02) -> torch.Tensor:
+    """Detect content vs. black border regions for stabilized/cropped footage.
+
+    Computes a spatial mask [H, W] where True = content pixel, False = border.
+    A pixel is considered border if its mean brightness across ALL frames is
+    below the threshold. This catches letterbox, pillarbox, and irregular
+    stabilization crops.
+
+    The mask is only used for statistics computation (frame means, CDFs).
+    Corrections are always applied to the full frame.
+
+    Args:
+        images: [B, H, W, C] sRGB tensor in [0, 1].
+        threshold: Brightness below this (across all frames) = border. Default
+            0.02 catches near-black borders without masking dark content.
+
+    Returns:
+        [H, W] boolean mask. True = content pixel.
+    """
+    # Mean brightness per pixel across all frames and channels
+    temporal_mean = images.mean(dim=(0, -1))  # [H, W]
+    mask = temporal_mean >= threshold
+
+    # Safety: if mask excludes >95% of pixels, it's probably a very dark
+    # scene, not actual borders — fall back to using everything.
+    if mask.sum() < mask.numel() * 0.05:
+        return torch.ones_like(mask, dtype=torch.bool)
+
+    return mask
+
 
 # ---------------------------------------------------------------------------
 # Temporal smoothing utilities
@@ -72,8 +106,121 @@ def temporal_median_smooth(values: torch.Tensor, window_size: int) -> torch.Tens
 
 
 # ---------------------------------------------------------------------------
+# Step removal — instant correction of latent space shifts
+# ---------------------------------------------------------------------------
+
+def _remove_steps(
+    ch_data: torch.Tensor,
+    content_mask: torch.Tensor | None = None,
+    threshold_mult: float = 5.0,
+    strength: float = 1.0,
+) -> torch.Tensor:
+    """Remove step discontinuities (latent space shifts) from a channel.
+
+    Detects sharp frame-to-frame brightness jumps that stand out from the
+    normal motion noise, then applies cumulative gain correction to undo
+    them instantly. Unlike temporal smoothing, this preserves the natural
+    brightness trend — it only removes the discrete steps.
+
+    Algorithm:
+    1. Compute per-frame means (masked).
+    2. Compute frame-to-frame diffs.
+    3. Detect outlier diffs (> threshold_mult × median abs diff).
+    4. Accumulate detected steps as a running correction.
+    5. Apply as per-frame gain: target / current.
+
+    Args:
+        ch_data: [N, H, W] single channel data.
+        content_mask: [H, W] bool mask. True = content pixel for stats.
+        threshold_mult: Sensitivity — how many times the median abs diff
+            counts as a step. Lower = more sensitive. Default 5.0.
+        strength: 0.0 = no correction, 1.0 = full step removal.
+
+    Returns:
+        Corrected [N, H, W] tensor.
+    """
+    N = ch_data.shape[0]
+    if N < 3:
+        return ch_data.clone()
+
+    flat = ch_data.reshape(N, -1)
+
+    # Compute per-frame means (using content mask if provided)
+    if content_mask is not None:
+        mask_flat = content_mask.reshape(-1)
+        if mask_flat.any():
+            frame_means = flat[:, mask_flat].mean(dim=1)
+        else:
+            frame_means = flat.mean(dim=1)
+    else:
+        frame_means = flat.mean(dim=1)
+
+    # Frame-to-frame diffs
+    diffs = frame_means[1:] - frame_means[:-1]
+
+    # Threshold: outlier diffs relative to the typical noise.
+    # Use a brightness-relative floor so detection works even when frames
+    # are nearly identical (e.g., static scene with only step changes).
+    median_abs_diff = diffs.abs().median()
+    floor = frame_means.mean().item() * 0.005  # 0.5% of mean brightness
+    threshold = max(median_abs_diff.item() * threshold_mult, floor)
+
+    if threshold < 1e-6:
+        return ch_data.clone()
+
+    # Accumulate step corrections
+    cumulative = torch.zeros(N, device=ch_data.device)
+    running = 0.0
+    for i in range(len(diffs)):
+        if diffs[i].abs() > threshold:
+            running -= diffs[i].item()
+        cumulative[i + 1] = running
+
+    # No steps detected
+    if abs(running) < 1e-6 and cumulative.abs().max() < 1e-6:
+        return ch_data.clone()
+
+    # Blend with strength
+    cumulative = cumulative * strength
+
+    # Apply as gain correction (preserves black levels)
+    target_means = frame_means + cumulative
+    safe_means = frame_means.clamp(min=1e-2)
+    gains = (target_means / safe_means).clamp(0.25, 4.0).view(-1, 1, 1)
+
+    return ch_data * gains
+
+
+# ---------------------------------------------------------------------------
 # Adaptive trend detection
 # ---------------------------------------------------------------------------
+
+def _masked_frame_means(
+    images: torch.Tensor, content_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute per-frame mean brightness using only content pixels.
+
+    Args:
+        images: [B, H, W, C] or [B, H, W].
+        content_mask: [H, W] bool mask, or None for all pixels.
+
+    Returns:
+        [B] tensor of per-frame means.
+    """
+    if content_mask is None:
+        if images.dim() == 4:
+            return images.mean(dim=(1, 2, 3))
+        return images.mean(dim=(1, 2))
+
+    if images.dim() == 4:
+        # [B, H, W, C] -> mask [H, W] -> expand to [H, W, C]
+        mask_expanded = content_mask.unsqueeze(-1).expand_as(images[0])
+        flat = images[:, mask_expanded].reshape(images.shape[0], -1)
+    else:
+        # [B, H, W]
+        flat = images[:, content_mask]
+    return flat.mean(dim=1)
+
 
 def _detect_trend(frame_means: torch.Tensor) -> bool:
     """Detect whether there's a significant linear trend in the frame means.
@@ -112,6 +259,7 @@ def _correct_channel(
     strength: float,
     smooth_fn,
     has_trend: bool = False,
+    content_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Correct a single channel's temporal flicker using gain-based correction.
 
@@ -128,6 +276,7 @@ def _correct_channel(
         strength: correction strength (0-1).
         smooth_fn: temporal smoothing function.
         has_trend: if True, preserve slow brightness changes.
+        content_mask: [H, W] bool mask. True = content pixel for stats.
 
     Returns:
         Corrected [N, H, W] (unclamped — caller handles clamping).
@@ -135,7 +284,12 @@ def _correct_channel(
     num_frames = ch_data.shape[0]
     flat = ch_data.reshape(num_frames, -1)
 
-    frame_means = flat.mean(dim=1)  # [N]
+    # Use only content pixels for statistics, but correct all pixels
+    if content_mask is not None:
+        mask_flat = content_mask.reshape(-1)
+        frame_means = flat[:, mask_flat].mean(dim=1)  # [N]
+    else:
+        frame_means = flat.mean(dim=1)  # [N]
     global_mean = frame_means.mean()
 
     if has_trend:
@@ -194,16 +348,18 @@ def _correct_channel_grid(
     smooth_fn,
     has_trend: bool,
     grid_size: int,
+    content_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Correct a single channel using per-cell gain on a spatial grid.
 
-    Computes per-cell means using avg_pool2d, then applies multiplicative
-    gain correction per cell with bilinear-interpolated seams.
+    Computes per-cell means, then applies multiplicative gain correction
+    per cell with bilinear-interpolated seams.
 
     Args:
         ch_data: [N, H, W] single channel.
         window_size, strength, smooth_fn, has_trend: same as _correct_channel.
         grid_size: number of cells per axis.
+        content_mask: [H, W] bool mask. True = content pixel for stats.
 
     Returns:
         Corrected [N, H, W].
@@ -211,17 +367,37 @@ def _correct_channel_grid(
     N, H, W = ch_data.shape
     device = ch_data.device
 
-    # Compute per-cell means using adaptive avg pool
-    # [N, H, W] -> [N, 1, H, W] -> pool to [N, 1, grid, grid]
-    data_4d = ch_data.unsqueeze(1)
-    cell_means = F.adaptive_avg_pool2d(data_4d, grid_size).squeeze(1)  # [N, G, G]
+    # Fast path: no mask → use adaptive_avg_pool2d (fused GPU kernel)
+    if content_mask is None:
+        data_4d = ch_data.unsqueeze(1)
+        cell_means_pooled = F.adaptive_avg_pool2d(data_4d, grid_size).squeeze(1)  # [N, G, G]
+
+    cell_h = H / grid_size
+    cell_w = W / grid_size
 
     # For each cell: compute gain = target_mean / current_mean
     gains = torch.ones(N, grid_size, grid_size, device=device)
 
     for gy in range(grid_size):
         for gx in range(grid_size):
-            cm = cell_means[:, gy, gx]  # [N]
+            if content_mask is None:
+                # Fast path: use pooled means
+                cm = cell_means_pooled[:, gy, gx]  # [N]
+            else:
+                y0 = round(gy * cell_h)
+                y1 = round((gy + 1) * cell_h)
+                x0 = round(gx * cell_w)
+                x1 = round((gx + 1) * cell_w)
+
+                cell_data = ch_data[:, y0:y1, x0:x1]
+                cell_flat = cell_data.reshape(N, -1)
+                cell_mask = content_mask[y0:y1, x0:x1].reshape(-1)
+                if cell_mask.any():
+                    cm = cell_flat[:, cell_mask].mean(dim=1)
+                else:
+                    # Entire cell is border — skip correction
+                    continue
+
             global_mean = cm.mean()
 
             if has_trend:
@@ -311,19 +487,23 @@ def deflicker_frames(
     pixel_smoothing: float = 0.0,
     grid_size: int = 1,
     drift_mode: str = "auto",
+    content_mask: torch.Tensor | None = None,
+    mode: str = "temporal_smoothing",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Remove temporal brightness/color flicker from a frame sequence.
 
-    Two-phase correction:
-    1. Per-frame statistics correction: equalizes per-frame mean brightness
-       using adaptive trend detection + iterative smoothing.
-    2. Per-pixel temporal smoothing (optional): averages each pixel across
-       neighboring frames to remove spatially-varying flicker.
+    Supports two correction modes:
+    - temporal_smoothing: Gaussian/median smoothing of per-frame statistics.
+      Best for random per-frame flicker (AI video noise).
+    - step_removal: Instant correction of sharp brightness steps caused by
+      latent space shifts. Preserves natural trends, removes only discontinuities.
+    - both: Step removal first, then temporal smoothing.
 
     Args:
         images: [B, H, W, 3] sRGB tensor in [0, 1].
         window_size: Temporal smoothing window in frames. Controls the
             separation between "flicker" (removed) and "trend" (preserved).
+            Only used in temporal_smoothing/both modes.
         strength: 0.0 = no correction, 1.0 = full correction.
         channels: "L" = brightness only (uniform delta across RGB),
                   "LAB" = per-channel correction (fixes color flicker too).
@@ -333,6 +513,11 @@ def deflicker_frames(
         drift_mode: "auto" = detect trend automatically,
                     "flicker_only" = remove all changes including slow drift,
                     "preserve_trend" = always keep slow brightness changes.
+        content_mask: [H, W] bool mask from _compute_content_mask(). If None,
+            computed automatically.
+        mode: "temporal_smoothing" = classic window-based correction,
+              "step_removal" = instant step discontinuity correction,
+              "both" = step removal then temporal smoothing.
 
     Returns:
         (corrected_images, debug_heatmap) — both [B, H, W, 3].
@@ -345,40 +530,69 @@ def deflicker_frames(
 
     smooth_fn = temporal_median_smooth if use_median else temporal_smooth
 
-    # Determine trend handling based on drift_mode
-    if drift_mode == "flicker_only":
-        has_trend = False
-    elif drift_mode == "preserve_trend":
-        has_trend = True
-    else:
-        # Auto: detect trend from brightness
-        brightness_means = images.mean(dim=(2, 3)).mean(dim=1)
-        has_trend = _detect_trend(brightness_means)
+    # Auto-detect black borders (stabilized/cropped footage)
+    if content_mask is None:
+        content_mask = _compute_content_mask(images)
 
-    # --- Phase 1: Per-frame statistics correction ---
-    correct_fn = _correct_channel if grid_size <= 1 else (
-        lambda ch, ws, st, sf, ht: _correct_channel_grid(ch, ws, st, sf, ht, grid_size)
-    )
+    do_steps = mode in ("step_removal", "both")
+    do_temporal = mode in ("temporal_smoothing", "both")
 
-    if channels == "L":
-        brightness = images.mean(dim=-1)
-        corrected_brightness = correct_fn(
-            brightness, window_size, strength, smooth_fn, has_trend,
-        )
-        # Apply as multiplicative gain map to preserve black levels
-        gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
-        gain_map = gain_map.clamp(0.25, 4.0)
-        corrected = (images * gain_map).clamp(0.0, 1.0)
-    else:
-        corrected = images.clone()
-        for ch in range(3):
-            corrected[..., ch] = correct_fn(
-                images[..., ch], window_size, strength, smooth_fn, has_trend,
+    corrected = images
+
+    # --- Phase 0: Step removal (latent space shift correction) ---
+    if do_steps:
+        if channels == "L":
+            brightness = corrected.mean(dim=-1)  # [N, H, W]
+            corrected_brightness = _remove_steps(
+                brightness, content_mask, strength=strength,
             )
-        corrected = corrected.clamp(0.0, 1.0)
+            gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
+            gain_map = gain_map.clamp(0.25, 4.0)
+            corrected = (corrected * gain_map).clamp(0.0, 1.0)
+        else:
+            corrected = corrected.clone()
+            for ch in range(3):
+                corrected[..., ch] = _remove_steps(
+                    corrected[..., ch], content_mask, strength=strength,
+                ).clamp(0.0, 1.0)
+
+    # --- Phase 1: Per-frame statistics correction (temporal smoothing) ---
+    if do_temporal:
+        # Determine trend handling based on drift_mode
+        if drift_mode == "flicker_only":
+            has_trend = False
+        elif drift_mode == "preserve_trend":
+            has_trend = True
+        else:
+            brightness_means = _masked_frame_means(corrected, content_mask)
+            has_trend = _detect_trend(brightness_means)
+
+        correct_fn = (
+            lambda ch, ws, st, sf, ht: _correct_channel(ch, ws, st, sf, ht, content_mask)
+        ) if grid_size <= 1 else (
+            lambda ch, ws, st, sf, ht: _correct_channel_grid(
+                ch, ws, st, sf, ht, grid_size, content_mask,
+            )
+        )
+
+        if channels == "L":
+            brightness = corrected.mean(dim=-1)
+            corrected_brightness = correct_fn(
+                brightness, window_size, strength, smooth_fn, has_trend,
+            )
+            gain_map = (corrected_brightness / brightness.clamp(min=1e-4)).unsqueeze(-1)
+            gain_map = gain_map.clamp(0.25, 4.0)
+            corrected = (corrected * gain_map).clamp(0.0, 1.0)
+        else:
+            tmp = corrected.clone()
+            for ch in range(3):
+                tmp[..., ch] = correct_fn(
+                    corrected[..., ch], window_size, strength, smooth_fn, has_trend,
+                )
+            corrected = tmp.clamp(0.0, 1.0)
 
     # --- Phase 2: Per-pixel temporal smoothing (optional) ---
-    if pixel_smoothing > 0:
+    if pixel_smoothing > 0 and do_temporal:
         corrected = _pixel_temporal_smooth(
             corrected, window_size, pixel_smoothing * strength,
         )
