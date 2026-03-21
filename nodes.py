@@ -1,7 +1,7 @@
 import torch
 
 from .brightness_core import auto_brightness_equalize
-from .flicker_core import deflicker_frames, _compute_content_mask
+from .flicker_core import deflicker_frames, _compute_content_mask, _generate_correction_heatmap
 
 
 class DeflickerFrames:
@@ -10,40 +10,44 @@ class DeflickerFrames:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "mode": (["temporal_smoothing", "step_removal", "both"], {
-                    "default": "temporal_smoothing",
-                    "tooltip": "Temporal smoothing: Gaussian window-based correction for random flicker. Step removal: instant correction of sharp latent space shifts. Both: step removal first, then temporal smoothing.",
-                }),
-                "window_size": ("INT", {
-                    "default": 15, "min": 3, "max": 999, "step": 2,
-                    "tooltip": "Temporal smoothing window (frames). Larger = more aggressive. Only used in temporal_smoothing/both modes.",
-                }),
-                "strength": ("FLOAT", {
-                    "default": 1.2, "min": 0.0, "max": 2.0, "step": 0.05,
-                    "tooltip": "Correction strength. 0 = off, 1 = full, >1 = overcorrect.",
+                "mode": (["step_removal", "temporal_smoothing", "both"], {
+                    "default": "step_removal",
+                    "tooltip": "Step removal: instant correction of sharp latent space shifts. Temporal smoothing: Gaussian window-based correction for random flicker. Both: step removal first, then temporal smoothing.",
                 }),
                 "channels": (["L", "LAB"], {
                     "default": "L",
-                    "tooltip": "LAB: brightness + color. L: brightness only.",
+                    "tooltip": "L: brightness only — preserves original colors. LAB: brightness + color correction.",
                 }),
-                "drift_mode": (["auto", "flicker_only", "preserve_trend"], {
+                "step_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Step removal strength. 1 = full correction. Ignored in temporal_smoothing mode.",
+                }),
+                "smooth_strength": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                    "tooltip": "Temporal smoothing strength. 1 = full, >1 = overcorrect. Ignored in step_removal mode.",
+                }),
+                "smooth_window": ("INT", {
+                    "default": 15, "min": 3, "max": 999, "step": 2,
+                    "tooltip": "Temporal smoothing window (frames). Larger = more aggressive. Ignored in step_removal mode.",
+                }),
+                "smooth_drift": (["auto", "flicker_only", "preserve_trend"], {
                     "default": "auto",
-                    "tooltip": "Auto: detect trend automatically. Flicker only: remove all brightness changes including slow drift. Preserve trend: always keep slow brightness changes.",
+                    "tooltip": "Ignored in step_removal mode. Auto: detect trend automatically. Flicker only: remove all brightness changes. Preserve trend: keep slow changes.",
                 }),
-                "use_median": ("BOOLEAN", {
+                "smooth_median": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Median pre-filter for extreme outlier frames.",
+                    "tooltip": "Ignored in step_removal mode. Median pre-filter for extreme outlier frames.",
                 }),
-                "pixel_smoothing": ("FLOAT", {
+                "smooth_pixel": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Per-pixel temporal smoothing. 0=off, 0.3-0.5=AI video.",
+                    "tooltip": "Ignored in step_removal mode. Per-pixel temporal smoothing. 0=off, 0.3-0.5=AI video.",
                 }),
-                "grid_size": ("INT", {
+                "smooth_grid": ("INT", {
                     "default": 1, "min": 1, "max": 8, "step": 1,
-                    "tooltip": "Spatial grid for correction. 1 = global, 6 = 6x6 zones for spatially varying flicker.",
+                    "tooltip": "Spatial grid for correction. 1 = global, 6 = 6x6 zones. Used by temporal smoothing and equalize.",
                 }),
-                "equalize": ("BOOLEAN", {
-                    "default": True,
+                "eq_enable": ("BOOLEAN", {
+                    "default": False,
                     "tooltip": "Auto brightness equalize: detect and smooth chunk boundary jumps after deflicker.",
                 }),
                 "eq_blend_radius": ("INT", {
@@ -62,27 +66,49 @@ class DeflickerFrames:
     FUNCTION = "deflicker"
     CATEGORY = "deflicker"
 
-    def deflicker(self, images, mode, window_size, strength, channels, drift_mode,
-                  use_median, pixel_smoothing, grid_size, equalize, eq_blend_radius,
-                  eq_sensitivity):
+    def deflicker(self, images, mode, channels, step_strength, smooth_strength,
+                  smooth_window, smooth_drift, smooth_median, smooth_pixel,
+                  smooth_grid, eq_enable, eq_blend_radius, eq_sensitivity):
         # Compute content mask once from original images (excludes black borders)
         content_mask = _compute_content_mask(images)
 
-        # Phase 1: Deflicker (temporal smoothing / step removal / both)
-        corrected, heatmap = deflicker_frames(
-            images=images, window_size=window_size, strength=strength,
-            channels=channels, use_median=use_median,
-            pixel_smoothing=pixel_smoothing, grid_size=grid_size,
-            drift_mode=drift_mode, content_mask=content_mask,
-            mode=mode,
-        )
+        if mode == "both":
+            # Run step removal and temporal smoothing with separate strengths
+            corrected, _ = deflicker_frames(
+                images=images, window_size=smooth_window,
+                strength=step_strength,
+                channels=channels, use_median=smooth_median,
+                pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
+                drift_mode=smooth_drift, content_mask=content_mask,
+                mode="step_removal",
+            )
+            corrected, _ = deflicker_frames(
+                images=corrected, window_size=smooth_window,
+                strength=smooth_strength,
+                channels=channels, use_median=smooth_median,
+                pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
+                drift_mode=smooth_drift, content_mask=content_mask,
+                mode="temporal_smoothing",
+            )
+            # Heatmap shows total correction vs original
+            heatmap = _generate_correction_heatmap(corrected, images)
+        else:
+            strength = step_strength if mode == "step_removal" else smooth_strength
+            corrected, heatmap = deflicker_frames(
+                images=images, window_size=smooth_window,
+                strength=strength,
+                channels=channels, use_median=smooth_median,
+                pixel_smoothing=smooth_pixel, grid_size=smooth_grid,
+                drift_mode=smooth_drift, content_mask=content_mask,
+                mode=mode,
+            )
 
-        # Phase 2: Auto brightness equalize (boundary smoothing)
-        if equalize:
+        # Equalize (boundary smoothing)
+        if eq_enable:
             corrected, eq_heatmap = auto_brightness_equalize(
                 images=corrected, blend_radius=eq_blend_radius,
-                strength=strength, sensitivity=eq_sensitivity,
-                grid_size=grid_size, content_mask=content_mask,
+                strength=1.0, sensitivity=eq_sensitivity,
+                grid_size=smooth_grid, content_mask=content_mask,
             )
 
         return (corrected, heatmap)

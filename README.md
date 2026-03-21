@@ -40,17 +40,21 @@ The node outputs two images:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mode` | temporal_smoothing | **temporal_smoothing**: Gaussian window-based correction for random per-frame flicker. **step_removal**: instant correction of sharp brightness steps caused by latent space shifts — preserves natural trends, only removes discontinuities. **both**: step removal first, then temporal smoothing. |
-| `window_size` | 15 | Temporal smoothing window in frames. Larger = more aggressive flicker removal. Use 11–15 for mild flicker, 21–31 for heavy flicker. Must be odd. Only used in temporal_smoothing/both modes. |
-| `strength` | 1.2 | Correction strength. 0 = off, 1 = full correction, >1 = overcorrect (useful for stubborn flicker). **Caution:** values much above 1.5 may introduce artifacts. |
-| `channels` | L | `L`: brightness only — preserves original color relationships. `LAB`: corrects each channel independently — removes both brightness and color temperature flicker. |
-| `drift_mode` | auto | `auto`: automatically detects slow brightness trends and preserves them. `flicker_only`: removes all brightness changes including slow drift — use this if slow brightness drift is not being corrected. `preserve_trend`: always keeps slow brightness changes. |
-| `use_median` | off | Median pre-filter before Gaussian smoothing. Turn on if you have extreme outlier frames (single very bright/dark frames). |
-| `pixel_smoothing` | 0.0 | Per-pixel temporal smoothing. `0.0` = off. `0.3–0.5` = recommended for AI video with spatially varying flicker. **Warning:** can cause ghosting on fast-moving objects. Start low and increase carefully. |
-| `grid_size` | 1 | Spatial grid for correction. `1` = global (whole frame corrected uniformly). Higher values (e.g. `6`) split the frame into zones for spatially varying flicker where different parts of the frame flicker differently. |
-| `equalize` | on | Auto brightness equalize — detects and smooths chunk boundary brightness jumps after deflicker. |
-| `eq_blend_radius` | 5 | Equalize: number of frames to blend around each detected boundary. |
-| `eq_sensitivity` | 1.5 | Equalize: boundary detection sensitivity. Lower = detects smaller jumps (more sensitive). Range 1.0–6.0. |
+| **mode** | step_removal | **step_removal**: instant correction of sharp brightness steps caused by latent space shifts — preserves natural trends, only removes discontinuities. **temporal_smoothing**: Gaussian window-based correction for random per-frame flicker. **both**: step removal first, then temporal smoothing. |
+| **channels** | L | `L`: brightness only — preserves original colors. `LAB`: brightness + color correction. |
+| | | **Step Removal** |
+| `step_strength` | 1.0 | Step removal correction strength. 0 = off, 1 = full. Ignored in temporal_smoothing mode. |
+| | | **Temporal Smoothing** |
+| `smooth_strength` | 1.0 | Temporal smoothing strength. 0 = off, 1 = full, >1 = overcorrect. Ignored in step_removal mode. **Caution:** values above 1.5 may introduce artifacts. |
+| `smooth_window` | 15 | Temporal smoothing window in frames. Larger = more aggressive. Use 11–15 for mild flicker, 21–31 for heavy. Must be odd. Ignored in step_removal mode. |
+| `smooth_drift` | auto | `auto`: detect trends automatically. `flicker_only`: remove all brightness changes. `preserve_trend`: keep slow changes. Ignored in step_removal mode. |
+| `smooth_median` | off | Median pre-filter for extreme outlier frames. Ignored in step_removal mode. |
+| `smooth_pixel` | 0.0 | Per-pixel temporal smoothing. 0=off, 0.3–0.5=AI video. **Warning:** can cause ghosting. Ignored in step_removal mode. |
+| `smooth_grid` | 1 | Spatial grid. 1 = global, 6 = 6x6 zones for spatially varying flicker. Ignored in step_removal mode. |
+| | | **Equalize** |
+| `eq_enable` | off | Auto brightness equalize: detect and smooth chunk boundary jumps. |
+| `eq_blend_radius` | 5 | Number of frames to blend around each detected boundary. |
+| `eq_sensitivity` | 1.5 | Boundary detection sensitivity. Lower = more sensitive. Range 1.0–6.0. |
 
 ## How it works
 
@@ -68,9 +72,9 @@ Computes per-frame mean brightness and normalizes it across the sequence using G
 
 Applies a Gaussian-weighted temporal average per pixel across neighboring frames. Helps with flicker that varies spatially within each frame. Can soften fast motion at high values.
 
-**Phase 3 — Auto brightness equalize (when `equalize` is on)**
+**Phase 3 — Auto brightness equalize (when `eq_enable` is on)**
 
-Detects brightness discontinuities at chunk boundaries (common in multi-chunk AI video generation). Converts to LAB color space, finds frames with abnormal brightness jumps, and applies CDF histogram matching to smoothly blend across boundaries. When `grid_size > 1`, matching runs per spatial zone.
+Detects brightness discontinuities at chunk boundaries (common in multi-chunk AI video generation). Converts to LAB color space, finds frames with abnormal brightness jumps, and applies CDF histogram matching to smoothly blend across boundaries. When `smooth_grid > 1`, matching runs per spatial zone.
 
 **Auto border masking**
 
@@ -80,11 +84,11 @@ Automatically detects black borders from stabilized/cropped footage (letterbox, 
 
 - **Start with defaults** — they work well for most AI-generated video
 - **Use `step_removal` mode** for sharp latent space brightness shifts that temporal smoothing can't fix. Use `both` if you have both step shifts and random flicker.
-- **Increase `window_size`** (e.g. 25–31) if flicker is still visible. For long sequences (200+ frames), values up to 101–201 can be useful.
-- **Increase `strength`** above 1.0 if correction is not strong enough
-- **Set `drift_mode` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
-- **Turn on `pixel_smoothing`** (0.3–0.5) if different parts of the frame flicker differently
-- **Increase `grid_size`** (e.g. 4–6) only if the flicker is not uniform across the frame (e.g. one side flickers more than the other). The default global correction works well for most cases.
+- **Increase `smooth_window`** (e.g. 25–31) if flicker is still visible. For long sequences (200+ frames), values up to 101–201 can be useful.
+- **Increase `smooth_strength`** above 1.0 if temporal correction is not strong enough
+- **Set `smooth_drift` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
+- **Turn on `smooth_pixel`** (0.3–0.5) if different parts of the frame flicker differently
+- **Increase `smooth_grid`** (e.g. 4–6) only if the flicker is not uniform across the frame (e.g. one side flickers more than the other). The default global correction works well for most cases.
 - **Lower `eq_sensitivity`** (e.g. 1.0) to catch subtle chunk boundaries
 - **Stabilized footage** with black borders is handled automatically — no need to crop first
 
