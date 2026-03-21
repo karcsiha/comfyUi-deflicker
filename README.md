@@ -40,9 +40,10 @@ The node outputs two images:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `window_size` | 15 | Temporal smoothing window in frames. Larger = more aggressive flicker removal. Use 11–15 for mild flicker, 21–31 for heavy flicker. Must be odd. |
+| `mode` | temporal_smoothing | **temporal_smoothing**: Gaussian window-based correction for random per-frame flicker. **step_removal**: instant correction of sharp brightness steps caused by latent space shifts — preserves natural trends, only removes discontinuities. **both**: step removal first, then temporal smoothing. |
+| `window_size` | 15 | Temporal smoothing window in frames. Larger = more aggressive flicker removal. Use 11–15 for mild flicker, 21–31 for heavy flicker. Must be odd. Only used in temporal_smoothing/both modes. |
 | `strength` | 1.2 | Correction strength. 0 = off, 1 = full correction, >1 = overcorrect (useful for stubborn flicker). **Caution:** values much above 1.5 may introduce artifacts. |
-| `channels` | LAB | `LAB`: corrects each RGB channel independently — removes both brightness and color temperature flicker. `L`: brightness only — preserves original color relationships. |
+| `channels` | L | `L`: brightness only — preserves original color relationships. `LAB`: corrects each channel independently — removes both brightness and color temperature flicker. |
 | `drift_mode` | auto | `auto`: automatically detects slow brightness trends and preserves them. `flicker_only`: removes all brightness changes including slow drift — use this if slow brightness drift is not being corrected. `preserve_trend`: always keeps slow brightness changes. |
 | `use_median` | off | Median pre-filter before Gaussian smoothing. Turn on if you have extreme outlier frames (single very bright/dark frames). |
 | `pixel_smoothing` | 0.0 | Per-pixel temporal smoothing. `0.0` = off. `0.3–0.5` = recommended for AI video with spatially varying flicker. **Warning:** can cause ghosting on fast-moving objects. Start low and increase carefully. |
@@ -53,11 +54,15 @@ The node outputs two images:
 
 ## How it works
 
-The node runs up to three correction phases:
+The node runs up to four correction phases depending on mode:
 
-**Phase 1 — Per-frame statistics correction (always runs)**
+**Phase 0 — Step removal (when `mode` = step_removal or both)**
 
-Computes per-frame mean brightness and normalizes it across the sequence. Automatically detects whether the sequence has an intentional brightness trend (e.g. a gradual fade) and preserves it while removing per-frame noise. Contrast (standard deviation) is also normalized. When `grid_size > 1`, this runs independently per spatial zone.
+Detects sharp brightness discontinuities (latent space shifts) by finding frame-to-frame brightness changes that significantly exceed the normal noise level. Applies instant cumulative gain correction to undo each step. Unlike temporal smoothing, this preserves the natural brightness trend — it only removes the discrete jumps. Works well for stabilized footage generated in chunks.
+
+**Phase 1 — Per-frame statistics correction (when `mode` = temporal_smoothing or both)**
+
+Computes per-frame mean brightness and normalizes it across the sequence using Gaussian temporal smoothing. Automatically detects whether the sequence has an intentional brightness trend (e.g. a gradual fade) and preserves it while removing per-frame noise. When `grid_size > 1`, this runs independently per spatial zone.
 
 **Phase 2 — Per-pixel temporal smoothing (when `pixel_smoothing > 0`)**
 
@@ -67,20 +72,28 @@ Applies a Gaussian-weighted temporal average per pixel across neighboring frames
 
 Detects brightness discontinuities at chunk boundaries (common in multi-chunk AI video generation). Converts to LAB color space, finds frames with abnormal brightness jumps, and applies CDF histogram matching to smoothly blend across boundaries. When `grid_size > 1`, matching runs per spatial zone.
 
+**Auto border masking**
+
+Automatically detects black borders from stabilized/cropped footage (letterbox, pillarbox, irregular crops). Border pixels are excluded from all statistics computation so they don't distort the correction. Corrections are still applied to the full frame. No configuration needed — fully automatic.
+
 ## Tips
 
 - **Start with defaults** — they work well for most AI-generated video
-- **Increase `window_size`** (e.g. 25–31) if flicker is still visible
+- **Use `step_removal` mode** for sharp latent space brightness shifts that temporal smoothing can't fix. Use `both` if you have both step shifts and random flicker.
+- **Increase `window_size`** (e.g. 25–31) if flicker is still visible. For long sequences (200+ frames), values up to 101–201 can be useful.
 - **Increase `strength`** above 1.0 if correction is not strong enough
 - **Set `drift_mode` to `flicker_only`** if slow brightness drift is not being corrected — this removes all brightness changes, not just fast flicker
 - **Turn on `pixel_smoothing`** (0.3–0.5) if different parts of the frame flicker differently
 - **Increase `grid_size`** (e.g. 4–6) only if the flicker is not uniform across the frame (e.g. one side flickers more than the other). The default global correction works well for most cases.
 - **Lower `eq_sensitivity`** (e.g. 1.0) to catch subtle chunk boundaries
+- **Stabilized footage** with black borders is handled automatically — no need to crop first
 
 ## Technology
 
 - Pure PyTorch — all operations are GPU-compatible tensor ops
 - No external dependencies beyond torch
+- Automatic black border detection for stabilized/cropped footage
+- Step discontinuity detection via statistical outlier analysis
 - LAB color space for perceptual boundary correction
 - CDF histogram matching with 2048-bin resolution
 - Adaptive trend detection via linear regression
