@@ -168,16 +168,13 @@ def _remove_steps(
     if threshold < 1e-6:
         return ch_data.clone()
 
-    # Accumulate step corrections
+    # Accumulate step corrections (vectorized)
+    step_corrections = torch.where(diffs.abs() > threshold, -diffs, torch.zeros_like(diffs))
     cumulative = torch.zeros(N, device=ch_data.device)
-    running = 0.0
-    for i in range(len(diffs)):
-        if diffs[i].abs() > threshold:
-            running -= diffs[i].item()
-        cumulative[i + 1] = running
+    cumulative[1:] = step_corrections.cumsum(dim=0)
 
     # No steps detected
-    if abs(running) < 1e-6 and cumulative.abs().max() < 1e-6:
+    if cumulative.abs().max() < 1e-6:
         return ch_data.clone()
 
     # Blend with strength
@@ -478,6 +475,7 @@ def _pixel_temporal_smooth(
     return result
 
 
+@torch.no_grad()
 def deflicker_frames(
     images: torch.Tensor,
     window_size: int = 15,
@@ -526,7 +524,7 @@ def deflicker_frames(
     device = images.device
 
     if num_frames < 2 or strength <= 0:
-        return images.clone(), torch.zeros(num_frames, H, W, 3, device=device)
+        return images, torch.zeros(num_frames, H, W, 3, device=device)
 
     smooth_fn = temporal_median_smooth if use_median else temporal_smooth
 
@@ -615,8 +613,6 @@ def _generate_correction_heatmap(
 
     normalized = diff / max_abs
     heatmap = torch.zeros(B, H, W, 3, device=device)
-    pos_mask = normalized > 0
-    heatmap[..., 0][pos_mask] = normalized[pos_mask]
-    neg_mask = normalized < 0
-    heatmap[..., 2][neg_mask] = -normalized[neg_mask]
+    heatmap[..., 0] = normalized.clamp(min=0)
+    heatmap[..., 2] = (-normalized).clamp(min=0)
     return heatmap

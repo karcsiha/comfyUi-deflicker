@@ -298,11 +298,8 @@ def _generate_heatmap(correction_map: torch.Tensor) -> torch.Tensor:
 
     heatmap = torch.zeros(B, H, W, 3, device=device)
     # Positive (brightening) -> red
-    pos_mask = boosted > 0
-    heatmap[..., 0][pos_mask] = boosted[pos_mask]  # R
-    # Negative (darkening) -> blue
-    neg_mask = boosted < 0
-    heatmap[..., 2][neg_mask] = -boosted[neg_mask]  # B
+    heatmap[..., 0] = boosted.clamp(min=0)   # R = brightening
+    heatmap[..., 2] = (-boosted).clamp(min=0)  # B = darkening
 
     return heatmap
 
@@ -427,6 +424,7 @@ def _apply_cdf_correction_grid(
     return corrected, L_correction
 
 
+@torch.no_grad()
 def auto_brightness_equalize(
     images: torch.Tensor,
     blend_radius: int = 5,
@@ -481,12 +479,13 @@ def auto_brightness_equalize(
     # Use first ref_percent of frames as reference, normalize entire shot
     # to match that reference's histogram distribution.
     # ===================================================================
-    corrected_lab = lab.clone()
+    corrected_lab = lab  # no copy needed — Phase 1 writes in-place per channel
     correction_map = torch.zeros(num_frames, H, W, device=device)
 
     ref_end = ref_frames if ref_frames > 0 and num_frames > ref_frames else 0
 
     if ref_end > 0:
+        corrected_lab = lab.clone()  # need copy only when drift correction runs
         # Compute per-frame means for each LAB channel (masked)
         all_means = []  # [3, num_frames]
         for ch in range(3):
